@@ -3,19 +3,26 @@ package repository
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"github.com/lib/pq"
 	"github.com/linqcod/orders-manager/internal/model"
 )
 
 const (
-	getOrdersInfoQuery = `
-		SELECT o.id, o.product_id, o.count, p.type, pr.rack_id, pr.rack_type, r.title
-		FROM orders o
-		JOIN products p on o.product_id = p.id
-		JOIN products_racks pr on p.type = pr.product_type
-		JOIN racks r on r.id = pr.rack_id 
-		WHERE o.id = ANY($1)
-		ORDER BY r.id
+	getOrdersByIdsQuery = `
+		SELECT id, product_id, count
+		FROM orders
+		WHERE id = ANY($1)
+	`
+	getProductTypeByIdQuery = `
+		SELECT type
+		FROM products
+		WHERE id = $1
+	`
+	getRacksQuery = `
+		SELECT r.id, r.title, pr.rack_type
+		FROM racks r 
+		JOIN products_racks pr on $1 = pr.product_type AND r.id = pr.rack_id
 	`
 )
 
@@ -31,10 +38,10 @@ func NewOrderRepository(ctx context.Context, db *sql.DB) *OrderRepository {
 	}
 }
 
-func (r OrderRepository) GetOrdersInfo(orderIds []int64) ([]*model.OrderInfo, error) {
-	var results []*model.OrderInfo
+func (r OrderRepository) GetMainRacksInfo(orderIds []int64) (map[int64]*model.MainRack, error) {
+	var orderProducts []*model.OrderProduct
 
-	rows, err := r.db.QueryContext(r.ctx, getOrdersInfoQuery, pq.Array(orderIds))
+	rows, err := r.db.QueryContext(r.ctx, getOrdersByIdsQuery, pq.Array(orderIds))
 	if err != nil {
 		return nil, err
 	}
@@ -44,20 +51,71 @@ func (r OrderRepository) GetOrdersInfo(orderIds []int64) ([]*model.OrderInfo, er
 	defer rows.Close()
 
 	for rows.Next() {
-		var result model.OrderInfo
+		var orderProduct model.OrderProduct
 		if err := rows.Scan(
-			&result.OrderId,
-			&result.ProductId,
-			&result.Count,
-			&result.ProductType,
-			&result.RackId,
-			&result.RackType,
-			&result.RackTitle,
+			&orderProduct.OrderId,
+			&orderProduct.ProductId,
+			&orderProduct.ProductCount,
 		); err != nil {
 			return nil, err
 		}
-		results = append(results, &result)
+		orderProducts = append(orderProducts, &orderProduct)
 	}
 
-	return results, nil
+	mainRacks := make(map[int64]*model.MainRack)
+	for i := range orderProducts {
+		err = r.db.QueryRowContext(r.ctx, getProductTypeByIdQuery, orderProducts[i].ProductId).Scan(&orderProducts[i].ProductType)
+		if err != nil {
+			return nil, err
+		}
+
+		rows, err := r.db.QueryContext(r.ctx, getRacksQuery, orderProducts[i].ProductType)
+		if err != nil {
+			return nil, err
+		}
+		if rows.Err() != nil {
+			return nil, err
+		}
+		defer rows.Close()
+
+		var mainRackId int64 = -1
+		mainRackTitle := ""
+		for rows.Next() {
+			var rack model.Rack
+			if err := rows.Scan(
+				&rack.Id,
+				&rack.Title,
+				&rack.Type,
+			); err != nil {
+				return nil, err
+			}
+
+			if rack.Type == "Main" {
+				mainRackId = rack.Id
+				mainRackTitle = rack.Title
+			} else {
+				if orderProducts[i].SecondaryRacks == nil {
+					orderProducts[i].SecondaryRacks = make([]*model.SecondaryRack, 0)
+				}
+				orderProducts[i].SecondaryRacks = append(orderProducts[i].SecondaryRacks, &model.SecondaryRack{
+					Id:    rack.Id,
+					Title: rack.Title,
+				})
+			}
+		}
+
+		if mainRackId != -1 && mainRackTitle != "" {
+			if _, ok := mainRacks[mainRackId]; !ok {
+				mainRacks[mainRackId] = &model.MainRack{
+					Title:         mainRackTitle,
+					OrderProducts: make([]*model.OrderProduct, 0),
+				}
+			}
+			mainRacks[mainRackId].OrderProducts = append(mainRacks[mainRackId].OrderProducts, orderProducts[i])
+		} else {
+			return nil, errors.New("error: no main rack for order product")
+		}
+	}
+
+	return mainRacks, nil
 }
